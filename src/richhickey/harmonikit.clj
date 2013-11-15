@@ -6,16 +6,29 @@
 ;   the terms of this license.
 ;   You must not remove this notice, or any other, from this software.
 
+(ns richhickey.harmonikit
+  (:require [overtone.osc :as osc]
+            [overtone.osc.util :as osc-util]
+            [overtone.sc.buffer :as obuf]
+            [overtone.sc.server :as osrv]
+            [overtone.sc.ugens :as ougen]
+            [overtone.sc.machinery.synthdef :as osdef]
+            [overtone.sc.machinery.server.comms :as oscom]
+            [overtone.studio.inst :as oinst]
+            [overtone.sc.envelope :as oenv]
+            [overtone.sc.cgens.line :as olin]
+            [overtone.sc.node :as onode]
+            [clojure.core.async :as async]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.pprint :as pp]
+            ;; Needed to boot Overtone (Temporary)
+            [overtone.studio.mixer :as omix]))
 
-;;(ns richhickey.harmonikit) ;;not ready to be a lib yet, too much using etc, so this is an interactive file at present
-
-;; aargh with the using
-;; temporary until we can find where everything lives (not easy)
-(use 'overtone.live)
-(require '[overtone.osc :as osc])
-(require '[clojure.core.async :as async])
-(require '[clojure.edn :as edn])
-(require '[clojure.java.io :as io])
+;; Temporary
+(defonce __AUTO-BOOT__
+  (when (osrv/server-disconnected?)
+    (omix/boot-server-and-mixer)))
 
 ;; a dummy patch that will be used to calc offsets and mappings
 (def patch
@@ -77,9 +90,9 @@
 (def NHARMS 100)
 
 ;;todo - make buffers part of synth objects to support multitimbral
-(def b (buffer nparams))
+(def b (obuf/buffer nparams))
 
-(buffer-id b)
+(obuf/buffer-id b)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; patching overtone ;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -125,17 +138,17 @@
   synthdef loading is delayed until the server has succesfully
   connected."
   [sdef]
-  (assert (overtone.sc.machinery.synthdef/synthdef? sdef))
-  (dosync (alter overtone.sc.machinery.synthdef/loaded-synthdefs* assoc (:name sdef) sdef))
+  (assert (osdef/synthdef? sdef))
+  (dosync (alter osdef/loaded-synthdefs* assoc (:name sdef) sdef))
 
-  (when (server-connected?)
-    (let [bytes (overtone.sc.machinery.synthdef/synthdef-bytes sdef)]
-      (overtone.sc.machinery.server.comms/with-server-sync
-        (if (< (count bytes) (- overtone.osc.util/BUFFER-SIZE 4))
-          #(snd "/d_recv" bytes)
+  (when (osrv/server-connected?)
+    (let [bytes (osdef/synthdef-bytes sdef)]
+      (oscom/with-server-sync
+        (if (< (count bytes) (- osc-util/BUFFER-SIZE 4))
+          #(osrv/snd "/d_recv" bytes)
           (let [path (str (System/getProperty "java.io.tmpdir")  (-> (:name sdef) symbol name) ".scsyndef")]
-            (overtone.sc.machinery.synthdef/synthdef-write sdef path)
-            #(snd "/d_load" path)))
+            (osdef/synthdef-write sdef path)
+            #(osrv/snd "/d_load" path)))
         (str "whilst loading synthdef " (:name sdef))))))
 
 (alter-var-root #'overtone.sc.machinery.synthdef/load-synthdef (constantly load-synthdef-x))
@@ -155,35 +168,35 @@
                                                     level))
                 (number? level) (aset-double arr offset level)))]
     (blit patch offsets)
-    (buffer-write! buf arr)))
+    (obuf/buffer-write! buf arr)))
 
 (patch->buf patch b)
 
 (defn bget
-  ([bid k] (index:kr bid (-> offsets (get k))))
-  ([bid k1 k2] (index:kr bid (-> offsets (get k1) (get k2))))
-  ([bid k1 k2 k3] (index:kr bid (-> offsets (get k1) (get k2) (get k3)))))
+  ([bid k] (ougen/index:kr bid (-> offsets (get k))))
+  ([bid k1 k2] (ougen/index:kr bid (-> offsets (get k1) (get k2))))
+  ([bid k1 k2 k3] (ougen/index:kr bid (-> offsets (get k1) (get k2) (get k3)))))
 
 (defn scaled [aval scale ratio]
-  (with-overloaded-ugens
-    (* aval (exp (* scale ratio)))))
+  (ougen/with-overloaded-ugens
+    (* aval (ougen/exp (* scale ratio)))))
 
 (defn master-scaled [aval bid k aratio fratio]
-  (with-overloaded-ugens
+  (ougen/with-overloaded-ugens
     (* aval
-       (exp (* (bget bid :master-env k :ascale) aratio))
-       (exp (* (bget bid :master-env k :fscale) fratio)))))
+       (ougen/exp (* (bget bid :master-env k :ascale) aratio))
+       (ougen/exp (* (bget bid :master-env k :fscale) fratio)))))
 
 (defn scale8 [scale]
-  (with-overloaded-ugens
-    (pow 2 (* 3.0 scale))))
+  (ougen/with-overloaded-ugens
+    (ougen/pow 2 (* 3.0 scale))))
 
 (defn hscaled [aval bid h k]
-  (with-overloaded-ugens
-    (* aval (pow 2 (lin-lin (bget bid :harmonics k h) -1.0 1.0 -3.0 3.0)))))
+  (ougen/with-overloaded-ugens
+    (* aval (ougen/pow 2 (olin/lin-lin (bget bid :harmonics k h) -1.0 1.0 -3.0 3.0)))))
 
 (defn harm [h hf bid freq gate aratio fratio delay attack decay sustain fade release]
-  (with-overloaded-ugens
+  (ougen/with-overloaded-ugens
     (let [amp (/ (scaled
                   (scaled (bget bid :harmonics :gain h) (bget bid :harmonics :ascale h) aratio)
                   (bget bid :harmonics :ascale h) fratio)
@@ -194,21 +207,21 @@
           sustain (hscaled sustain bid h :sustain)
           fade (hscaled fade bid h :fade)
           release (hscaled release bid h :release)
-          ectl (envelope [0 0 1.0 sustain 0 0]
-                         [delay attack decay fade release]
-                         [0
-                          (bget bid :master-curves :attack)
-                          (bget bid :master-curves :decay)
-                          (bget bid :master-curves :fade)
-                          (bget bid :master-curves :release)]
-                         4)
-          env (env-gen:kr ectl gate)
+          ectl (oenv/envelope [0 0 1.0 sustain 0 0]
+                              [delay attack decay fade release]
+                              [0
+                               (bget bid :master-curves :attack)
+                               (bget bid :master-curves :decay)
+                               (bget bid :master-curves :fade)
+                               (bget bid :master-curves :release)]
+                              4)
+          env (ougen/env-gen:kr ectl gate)
           hfreq (* hf freq)]
       (* (bget bid :harmonics :toggle h)
          amp env
-         (sin-osc hfreq)
+         (ougen/sin-osc hfreq)
          ;;anti-alias
-         (select:kr (< hfreq 20000) [0.0 1.0])))))
+         (ougen/select:kr (< hfreq 20000) [0.0 1.0])))))
 
 (defmacro primary-harms [n bid freq gate aratio fratio delay attack decay sustain fade release]
   (let [hs (map (fn [h]
@@ -223,30 +236,30 @@
     (cons '+ hs)))
 
 (defn lfo [bid depth fratio]
-  (with-overloaded-ugens
-    (let [freq (scaled (lin-lin (bget bid :lfo :rate) 0.0 1.0 0.0 20.0)
+  (ougen/with-overloaded-ugens
+    (let [freq (scaled (olin/lin-lin (bget bid :lfo :rate) 0.0 1.0 0.0 20.0)
                        fratio (bget bid :lfo :fscale))
-          ectl (envelope [0 1.0]
+          ectl (oenv/envelope [0 1.0]
                          [(bget bid :lfo :ramp)]
                          :linear)
-          env (env-gen:kr ectl)]
-      (* (+ depth (bget bid :lfo :depth)) env (bget bid :lfo :toggle) (sin-osc:kr freq)))))
+          env (ougen/env-gen:kr ectl)]
+      (* (+ depth (bget bid :lfo :depth)) env (bget bid :lfo :toggle) (ougen/sin-osc:kr freq)))))
 
 (defn res [sig bid n]
-  (with-overloaded-ugens
+  (ougen/with-overloaded-ugens
     (* 10
        (bget bid :resonances :toggle n)
        (bget bid :resonances :gain n)
-       (resonz sig
-               (octcps (lin-lin (bget bid :resonances :freq n) 0.0 1.0 1.0 10.0))
+       (ougen/resonz sig
+               (ougen/octcps (olin/lin-lin (bget bid :resonances :freq n) 0.0 1.0 1.0 10.0))
                (bget bid :resonances :width n)))))
 
 (defn fine-rate [r]
-  (with-overloaded-ugens
-    (->> r (pow 2) (+ -1.0) squared)))
+  (ougen/with-overloaded-ugens
+    (->> r (ougen/pow 2) (+ -1.0) ougen/squared)))
 
 (defn fenv [fin bid aratio fratio]
-  (with-overloaded-ugens
+  (ougen/with-overloaded-ugens
     (let [ffscale (scale8 (bget bid :freq-envelope :freq-fscale))
           fascale (scale8 (bget bid :freq-envelope :freq-ascale))
           rfscale (scale8 (bget bid :freq-envelope :rate-fscale))
@@ -255,31 +268,31 @@
           r0 (fine-rate (bget bid :freq-envelope :rate));;(scaled (scaled (bget bid :freq-envelope :rate) rfscale fratio) rascale aratio)
           f1 (bget bid :freq-envelope :freq);;(scaled (scaled (bget bid :freq-envelope :freq) ffscale fratio) fascale aratio)
           r1 (fine-rate (bget bid :freq-envelope :return));;(scaled (scaled (bget bid :freq-envelope :return) rfscale fratio) rascale aratio)
-          ectl (envelope [f0 f1 0] ;;[1.0 -1.0 0]
+          ectl (oenv/envelope [f0 f1 0] ;;[1.0 -1.0 0]
                          [r0 r1] ;;[1.0 1.0]
                          :linear)
-          env (env-gen:kr ectl)]
-      (-> fin cpsoct (+ (* env (bget bid :freq-envelope :toggle))) octcps))))
+          env (ougen/env-gen:kr ectl)]
+      (-> fin ougen/cpsoct (+ (* env (bget bid :freq-envelope :toggle))) ougen/octcps))))
 
-(definst harmonikit
-  [bid (buffer-id b)
+(oinst/definst harmonikit
+  [bid (obuf/buffer-id b)
    note 60
    amp 0.25
    gate 1.0
    lfo-depth 0.0]
   (let [abase 0.125
         fbase 220
-        freq (midicps note)
-        aratio (log (/ amp abase))
-        fratio (log (/ freq fbase))
+        freq (ougen/midicps note)
+        aratio (ougen/log (/ amp abase))
+        fratio (ougen/log (/ freq fbase))
         lfo (lfo bid lfo-depth fratio)
         envfreq (fenv freq bid aratio fratio)
-        mfreq (-> envfreq cpsoct (+ (* (bget bid :lfo :freq-mod)
+        mfreq (-> envfreq ougen/cpsoct (+ (* (bget bid :lfo :freq-mod)
                                        (* 0.1 lfo)))
-                  octcps)
-        mamp (-> amp ampdb (+ (* (bget bid :lfo :amp-mod)
-                                 (* 60.0 lfo)))
-                 dbamp)
+                  ougen/octcps)
+        mamp (-> amp ougen/ampdb (+ (* (bget bid :lfo :amp-mod)
+                                       (* 60.0 lfo)))
+                 ougen/dbamp)
         
         gain (master-scaled (bget bid :master-env :gain :val) bid :gain aratio fratio)
         delay (bget bid :master-env :delay :val)
@@ -292,15 +305,15 @@
                             bid :fade aratio fratio)
         release (master-scaled (* 4.0 (bget bid :master-env :release :val))
                                bid :release aratio fratio)
-        ectl (envelope [0 0 1.0 sustain 0 0]
-                       [delay attack decay fade release]
-                       [0
-                        (bget bid :master-curves :attack)
-                        (bget bid :master-curves :decay)
-                        (bget bid :master-curves :fade)
-                        (bget bid :master-curves :release)]
-                       4)
-        env (env-gen:kr ectl gate mamp :action FREE)
+        ectl (oenv/envelope [0 0 1.0 sustain 0 0]
+                            [delay attack decay fade release]
+                            [0
+                             (bget bid :master-curves :attack)
+                             (bget bid :master-curves :decay)
+                             (bget bid :master-curves :fade)
+                             (bget bid :master-curves :release)]
+                            4)
+        env (ougen/env-gen:kr ectl gate mamp :action ougen/FREE)
         sig (* (bget bid :master :toggle)
                env gain
                (+ (primary-harms 24 bid mfreq gate aratio fratio delay attack decay sustain fade release)
@@ -364,7 +377,7 @@
 ;;to/from ./resources for now
 (defn save-patch [patch patch-name]
   (with-open [file (io/writer (str "./resources/" patch-name ".edn"))]
-    (binding [*out* file] (pprint patch))))
+    (binding [*out* file] (pp/pprint patch))))
 
 (defn load-patch [patch-name]
   (with-open [file (io/reader (str "./resources/" patch-name ".edn"))]
@@ -385,12 +398,13 @@
 (def schan (async/chan 10))
 (server->chan server schan)
 
-(async/go (loop []
-      (let [msg (async/<! schan)]
-        ;;(prn msg)
-        (swap! apatch edit-patch msg)
-        (patch->buf @apatch b)
-        (recur))))
+(async/go
+ (loop []
+   (let [msg (async/<! schan)]
+     ;;(prn msg)
+     (swap! apatch edit-patch msg)
+     (patch->buf @apatch b)
+     (recur))))
 
 (def qserver (osc/osc-server 8899))
 (osc/osc-rm-all-listeners qserver)
@@ -398,19 +412,27 @@
 (server->chan qserver qchan)
 (def notes (atom {}))
 ;;(osc-listen qserver (fn [msg] (println "Listener: " msg)) :debug)
-(async/go (loop []
-      (let [{:keys [path args]} (async/<! qchan)]
-        ;;(prn msg)
-        (when (= path "/qunexus/keys/note_and_velocity")
-          (let [[note vel] args]
-            (if (zero? vel)
-              (when-let [synth (get @notes note)]
-                (ctl synth :gate 0.0))
-              (swap! notes assoc note (harmonikit (buffer-id b) note (/ vel 127.0))))))
-        (recur))))
+(async/go
+ (loop []
+   (let [{:keys [path args]} (async/<! qchan)]
+     ;;(prn msg)
+     (when (= path "/qunexus/keys/note_and_velocity")
+       (let [[note vel] args]
+         (if (zero? vel)
+           (when-let [synth (get @notes note)]
+             (onode/ctl synth :gate 0.0))
+           (swap! notes assoc note (harmonikit (obuf/buffer-id b) note (/ vel 127.0))))))
+     (recur))))
 
+(comment
+  ;; Load a patch
+  (patch->buf patch b)
 
-;;(patch->buf patch b)
-(harmonikit (buffer-id b) 58)
-(ctl *1 :gate 0)
-(stop)
+  ;; Play a note
+  (harmonikit (buffer-id b) 70)
+
+  ;; Stop the note
+  (onode/ctl *1 :gate 0)
+
+  ;; Stop all notes
+  (osrv/stop))
